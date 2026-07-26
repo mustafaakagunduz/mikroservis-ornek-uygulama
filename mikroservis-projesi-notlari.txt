@@ -1,0 +1,10 @@
+Resume this session with:
+claude --resume 8beab2e7-976d-4bf1-84af-8d6c81f3dab0
+
+
+projeyi nasıl ayağa kaldırcam, şimdi projeyi çalıştırmak için ne yapmam gerekiyor
+
+colima start
+colima stop
+
+docker-compose up --build
