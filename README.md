@@ -98,29 +98,75 @@ Mikroservis mimarisinin temel kavramlarını — polyglot stack, event-driven il
 
 ---
 
-## Hızlı Başlangıç
+## Kurulum (Sıfırdan Ayağa Kaldırma)
 
-```bash
-# Tüm stack'i ayağa kaldır (ilk seferde ~5 dakika)
-docker compose up --build
+Bu repoyu klonlayan birinin projeyi lokalde sorunsuz ayağa kaldırması için adım adım kontrol listesi:
 
-# Örnek ürünleri ekle (stack ayakta olmalı)
-pip3 install httpx && python3 seed.py
-```
+### 1. Ön koşullar
 
-Tarayıcıdan **http://localhost:5173** adresini aç, kayıt ol, ürünleri gör, sipariş ver.  
-Sayfanın altındaki canlı log panelinden tüm servislerin event akışını izle.
+- [ ] **Docker** kurulu olmalı.
+  - macOS'ta Docker Desktop kullanmıyorsan **Colima** ile de çalışır: `brew install colima docker docker-compose` sonra `colima start`.
+  - Linux/Windows'ta Docker Desktop veya Docker Engine yeterli.
+- [ ] **Compose komutunu kontrol et** — bazı kurulumlarda `docker compose` (plugin), bazılarında `docker-compose` (standalone binary) var. Hangisi çalışıyorsa onu kullan, aşağıdaki komutlarda ikisi de birbirinin yerine geçer:
+  ```bash
+  docker compose version || docker-compose version
+  ```
+- [ ] **Python 3 + pip3** kurulu olmalı (örnek ürünleri eklemek için `seed.py` çalıştırılacak).
+- [ ] Aşağıdaki **portların boşta** olduğundan emin ol (başka bir servis kullanıyorsa çakışma/`bind: address already in use` hatası alırsın):
+  `5173` (frontend), `80` (gateway), `8001` (auth), `8002` (product), `8003` (order), `15672` (RabbitMQ panel).
 
----
+### 2. Repoyu al ve stack'i ayağa kaldır
 
-## Arayüzler
+- [ ] Repoyu klonla ve dizine gir:
+  ```bash
+  git clone <repo-url>
+  cd mikroservis-ornek-uygulama
+  ```
+- [ ] (macOS + Colima kullanıyorsan) Docker daemon'ı başlat:
+  ```bash
+  colima start
+  ```
+- [ ] Tüm servisleri build edip ayağa kaldır (ilk seferde imajlar build edileceği için birkaç dakika sürebilir):
+  ```bash
+  docker compose up --build
+  # ya da: docker-compose up --build
+  ```
+- [ ] Tüm altyapı servislerinde (`postgres-*`, `redis`, `mongodb`, `kafka`, `zookeeper`, `rabbitmq`) healthcheck var; uygulama servisleri bağımlılıklarının **healthy** olmasını bekleyerek başlar. Terminalde tüm container'ların "Started"/"Healthy" olduğunu görene kadar bekle — bu normal, hata değil.
+- [ ] (isteğe bağlı, ikinci bir terminalde) Her şeyin ayakta olduğunu doğrula:
+  ```bash
+  docker compose ps
+  ```
+  Tüm servisler `Up` (altyapı olanlar `Up (healthy)`) görünmeli.
 
-| | URL |
-|---|---|
-| Uygulama | http://localhost:5173 |
-| RabbitMQ Yönetim Paneli | http://localhost:15672 — `user` / `password` |
-| auth-service API docs | http://localhost:8001/docs |
-| order-service API docs | http://localhost:8003/docs |
+### 3. Örnek verileri yükle
+
+- [ ] Stack ayaktayken (yukarıdaki adım tamamlanmış olmalı) örnek ürünleri MongoDB'ye ekle:
+  ```bash
+  pip3 install httpx
+  python3 seed.py
+  ```
+  Her ürün için `✓ ... eklendi` çıktısını görmelisin.
+
+### 4. Uygulamayı dene
+
+- [ ] Tarayıcıdan **http://localhost:5173** adresini aç.
+- [ ] **Kayıt Ol** ile yeni bir kullanıcı oluştur, ardından giriş yap.
+- [ ] Ürünler sayfasında bir ürünü **Sepete Ekle**, Sepet sayfasından **Sipariş Ver**.
+- [ ] Siparişlerim sayfasında siparişin göründüğünü doğrula.
+- [ ] Sağdaki **canlı log panelinden** (Redis Pub/Sub → SSE) sipariş oluşturma akışının servisler arasında nasıl aktığını izle (`order-service` → `notification-service` / `inventory-service` → `email-worker`).
+
+### 5. Faydalı arayüzler (opsiyonel)
+
+- [ ] RabbitMQ yönetim paneli: http://localhost:15672 (`user` / `password`) — `email_jobs` kuyruğunu izleyebilirsin.
+- [ ] auth-service Swagger: http://localhost:8001/docs
+- [ ] order-service Swagger: http://localhost:8003/docs
+
+### Sorun giderme
+
+- **`docker-compose up` yavaş takılıyor / hiç bitmiyor gibi görünüyor** → Healthcheck'ler yüzünden servisler birbirini bekliyor, bu normal; ilk build + healthcheck süreci birkaç dakika sürebilir.
+- **Bir servisi tek başına `docker restart <servis>` ile yeniden başlattın ve gateway 502 vermeye başladı** → nginx, servisin eski IP'sini cache'lemiştir. `gateway` container'ını da restart et: `docker restart gateway`.
+- **`bind: address already in use` hatası** → Yukarıdaki port listesinden çakışan portu kullanan başka bir process'i kapat, ya da o process'i durdur.
+- **`seed.py` bağlanamıyor** → Stack'in tamamen ayakta olduğundan (`docker compose ps` ile) ve `product-service`/`gateway`'in `Up` durumda olduğundan emin ol.
 
 ---
 
@@ -148,8 +194,10 @@ cd services/email-worker && python3 -m pytest tests/ -v
 cd services/log-service && python3 -m pytest tests/ -v
 
 # notification-service — event→job dönüşüm mantığı (Go testing), Docker üzerinden
+# (host'ta Go kurulu değilse gerekli; -p=1/CGO_ENABLED=0/GOGC=20 düşük bellekli
+# ortamlarda, örn. Colima'nın varsayılan 2GB VM'inde, derleyicinin OOM'a takılmasını önler)
 cd services/notification-service
-docker run --rm -v "$(pwd)":/app -w /app -e GOFLAGS="-p=1" -e CGO_ENABLED=0 golang:1.24-alpine go test ./... -v
+docker run --rm -v "$(pwd)":/app -w /app -e GOFLAGS="-p=1" -e CGO_ENABLED=0 -e GOGC=20 golang:1.24-alpine go test ./... -v
 ```
 
 ---
