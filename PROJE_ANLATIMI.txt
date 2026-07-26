@@ -1,0 +1,717 @@
+================================================================================
+MİKROSERVİS ÖRNEK UYGULAMA — PROJE ANLATIMI
+Web geliştirme (frontend/backend/database) bilen ama mikroservis, Docker,
+mesaj kuyrukları ve CI/CD dünyasına yeni giren biri için hazırlanmıştır.
+================================================================================
+
+
+İÇİNDEKİLER
+
+1. Neden "mikroservis"? Alıştığın modelden farkı ne?
+2. Bu projenin genel haritası
+3. Docker ve Docker Compose — her şeyin üzerinde çalıştığı zemin
+4. Nginx / API Gateway — tek kapı
+5. PostgreSQL ve MongoDB — "her serviste kendi veritabanı" ilkesi
+6. Redis — hem hafıza hem anons sistemi
+7. Kafka — kaybolmayan, tekrar dinlenebilen olay günlüğü
+8. RabbitMQ — klasik iş kuyruğu
+9. Bu sistemde iletişim nasıl "kusursuz" çalışıyor (ve nerelerde çalışmıyor)
+10. CI/CD nedir, bu projede var mı?
+11. Servisleri ölçeklendirseydik (scale) nelere dikkat etmemiz gerekirdi?
+12. Kapanış ve sırada ne var
+
+
+
+--------------------------------------------------------------------------------
+1. NEDEN "MİKROSERVİS"? ALIŞTIĞIN MODELDEN FARKI NE?
+--------------------------------------------------------------------------------
+
+Bildiğin klasik web projesinde muhtemelen şu var: bir backend (tek bir Express/
+Django/Spring uygulaması), bir veritabanı, bir frontend. Kullanıcı kaydı da,
+ürün listesi de, sipariş de aynı kod tabanında, aynı process içinde, aynı
+veritabanında yaşıyor. Buna "monolit" (tek parça) denir.
+
+Monolitin sorunu şu değil ki "kötü" bir yaklaşım — küçük/orta projeler için
+genelde en doğru seçimdir. Sorun, proje büyüdükçe ortaya çıkar:
+
+- Ürün kataloğu ile ilgili küçük bir değişiklik yapmak için tüm uygulamayı
+  yeniden derleyip deploy etmen gerekir.
+- Sipariş modülü çok trafik alıyorsa, tüm uygulamayı (auth dahil) yatay
+  ölçeklendirmek zorunda kalırsın — halbuki sadece sipariş kısmını
+  büyütmen yeterli olurdu.
+- 50 kişilik bir ekip aynı kod tabanında çalışırken sürekli birbirine
+  çarpar (merge conflict, kimin neyi bozduğunu bulmak zorlaşır).
+- Ürün kataloğun için MongoDB'nin doküman modeli daha uygun olabilir ama
+  sipariş/ödeme gibi kesin tutarlılık (transaction) isteyen kısımlar için
+  PostgreSQL daha doğrudur — monolitte tek bir DB seçmek zorundasın.
+
+Mikroservis mimarisi bu sorunu şöyle çözer: uygulamayı, her biri **kendi
+veritabanına sahip, kendi başına deploy edilebilen, kendi dilinde yazılabilen,
+birbirinden bağımsız çalışan küçük servislere** böler. Bu projede:
+
+  auth-service      → Python/FastAPI  → kullanıcı, giriş
+  product-service   → Node.js/Express → ürün kataloğu
+  order-service     → Python/FastAPI  → sipariş
+  inventory-service → Python/FastAPI  → stok
+  notification-service → Go          → bildirim tetikleyici
+  email-worker      → Python          → mail gönderimi
+  log-service       → Python/FastAPI  → canlı log akışı
+
+Yedi ayrı "mini backend" var ve her biri ayrı bir container'da (bir sonraki
+bölümde ne olduğunu anlatacağım) çalışıyor. Bunun bedeli de var: artık
+servisler birbirine ağ üzerinden (HTTP, veya mesaj kuyruğu ile) konuşmak
+zorunda — aynı process içinde bir fonksiyon çağırmak kadar basit değil. Bu
+belgenin büyük kısmı, bu "servisler birbirine nasıl konuşuyor, ne zaman
+bozulabilir, nasıl sağlamlaştırılır" sorusuna ayrılacak.
+
+
+--------------------------------------------------------------------------------
+2. BU PROJENİN GENEL HARİTASI
+--------------------------------------------------------------------------------
+
+Kullanıcı tarayıcıdan http://localhost:5173 adresine girer (React uygulaması).
+Frontend, API isteklerini tek bir adrese atar: http://localhost/api/...
+Bu adresin arkasında Nginx denen bir "API Gateway" var, o isteği path'e göre
+doğru servise yönlendirir (detayı Bölüm 4'te).
+
+Bir sipariş verildiğinde olan biten:
+
+  1. Frontend → Gateway → order-service: "şu ürünlerden sipariş oluştur"
+  2. order-service, ürün fiyatını öğrenmek için product-service'e HTTP isteği
+     atar (senkron — cevabı bekler), token'ı doğrulamak için auth-service'e
+     HTTP isteği atar.
+  3. order-service, siparişi kendi veritabanına (PostgreSQL) yazar.
+  4. order-service, Kafka'ya "order.created" diye bir OLAY (event) yayınlar.
+     Bunu kimin dinlediğini order-service bilmez, umursamaz.
+  5. İki farklı servis bu olayı bağımsız olarak yakalar:
+     - notification-service (Go) → RabbitMQ'ya bir "mail gönder" görevi ekler
+       → email-worker bu görevi işler, mock mail "gönderir"
+     - inventory-service → kendi veritabanında ilgili ürünün stok
+       rezervasyonunu artırır
+  6. Bu adımların hepsi Redis üzerinden log-service'e bildirilir, o da
+     frontend'deki canlı log paneline anlık akıtır.
+
+Dikkat et: 3. adımdan sonra order-service'in işi bitmiştir, kullanıcıya
+cevap döner. 5. adımdaki iki servis, order-service'in HABERİ OLMADAN,
+KENDİ HIZLARINDA, arka planda çalışır. Bu "event-driven" (olay güdümlü)
+mimarinin can alıcı noktası — servisler birbirini beklemez, birbirine
+sıkı sıkıya bağlı (coupled) değildir.
+
+
+--------------------------------------------------------------------------------
+3. DOCKER VE DOCKER COMPOSE — HER ŞEYİN ÜZERİNDE ÇALIŞTIĞI ZEMİN
+--------------------------------------------------------------------------------
+
+CONTAINER (KONTEYNER) NEDİR?
+
+Normalde bir Python uygulamasını çalıştırmak için senin makinende Python
+kurulu olmalı, doğru versiyonda olmalı, gereken kütüphaneler kurulu olmalı.
+Başka birinin makinesinde bu "benim makinemde çalışıyordu" sorunlarına yol
+açar.
+
+Container, bir uygulamayı **kendi izole edilmiş, minik işletim sistemi
+görünümündeki ortamıyla birlikte** paketleme yöntemidir. "auth-service"
+container'ı, içinde Python 3.12, FastAPI, ve senin yazdığın kod ile birlikte
+paketlenmiş, kendi başına çalışabilen bir kutudur. Bu kutuyu senin
+makinende de, sunucuda da, arkadaşının makinesinde de birebir aynı şekilde
+çalıştırırsın.
+
+Bu proje 7 servis + 7 altyapı bileşeni (veritabanları, Kafka, RabbitMQ,
+Redis) olmak üzere toplam ~17 container'dan oluşuyor.
+
+IMAGE vs CONTAINER
+
+"Image" (imaj), bir container'ın donmuş halidir — "bu uygulamayı çalıştırmak
+için gereken her şeyin tarifi". `Dockerfile` dosyaları bu tarifi yazar.
+Örneğin `services/auth-service/Dockerfile`:
+
+    FROM python:3.12-slim      → temel olarak Python 3.12 kurulu bir Linux al
+    COPY requirements.txt .    → bağımlılık listesini kopyala
+    RUN pip install -r ...     → bağımlılıkları kur
+    COPY . .                   → kodun geri kalanını kopyala
+    CMD ["uvicorn", "main:app"]→ container başlayınca bu komutu çalıştır
+
+Bu tarife göre bir "image" inşa edilir (`docker build`), sonra o image'dan
+bir veya birden fazla çalışan "container" başlatılır (`docker run`).
+
+DOCKER COMPOSE
+
+17 container'ı tek tek elle `docker run` ile başlatmak, doğru ağ ayarlarını
+elle vermek, doğru sırayla başlatmak — çok can sıkıcı olurdu. Docker Compose,
+tüm bu container'ların tarifini **tek bir YAML dosyasında** (`docker-compose.yml`)
+tanımlamanı sağlar. Örnek bir blok:
+
+    order-service:
+      build: ./services/order-service      → bu klasördeki Dockerfile'dan inşa et
+      ports:
+        - "8003:8000"                       → senin makinendeki 8003 portunu,
+                                               container içindeki 8000'e bağla
+      environment:
+        DATABASE_URL: postgresql+asyncpg://user:password@postgres-order/orderdb
+        KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      depends_on:
+        postgres-order:
+          condition: service_healthy         → postgres-order gerçekten hazır
+                                               olmadan bu servisi başlatma
+
+`docker-compose up --build` dediğinde, Compose bu dosyayı okur, tüm image'ları
+inşa eder, container'ları doğru sırada (depends_on'a göre) ayağa kaldırır ve
+hepsini aynı sanal ağa (`networks: backend`) bağlar. Aynı ağdaki container'lar
+birbirine, IP adresi yerine **servis ismiyle** ulaşabilir — `order-service`
+container'ı `kafka:9092`'ye bağlanmak istediğinde, Docker'ın dahili DNS'i bu
+ismi otomatik doğru IP'ye çevirir. (Bu "otomatik çeviri" konusuna Bölüm 11'de
+tekrar döneceğiz — çünkü tam burada bir tuzak var.)
+
+HEALTHCHECK ve DEPENDS_ON
+
+`depends_on` sadece "önce şunu başlat" demektir — o servisin gerçekten
+**hazır** (isteklere cevap verebilir) olduğu anlamına gelmez. Bir PostgreSQL
+container'ı "başlamış" olabilir ama içeride veritabanı henüz initialize
+olmuyor olabilir; bir Kafka container'ı "başlamış" olabilir ama henüz mesaj
+kabul edecek duruma gelmemiş olabilir.
+
+Bu proje ilk halinde tam olarak bu yüzden arıza veriyordu: `inventory-service`,
+Kafka "başladı" der demez bağlanmaya çalışıyor, Kafka henüz gerçekten hazır
+olmadığı için bağlantı reddediliyordu. Bunu çözmek için her altyapı
+bileşenine bir `healthcheck` tanımladık — örneğin Redis için:
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+Docker bu komutu periyodik olarak container içinde çalıştırır, "PONG" cevabı
+gelene kadar o container'ı "healthy" saymaz. Sonra bağımlı servislerde
+`depends_on: redis: condition: service_healthy` yazarak "Redis gerçekten
+PONG diyene kadar beni başlatma" dedik. Bu, mikroserviste çok klasik bir
+"başlangıç sırası" (startup ordering) problemi ve standart çözümü.
+
+
+--------------------------------------------------------------------------------
+4. NGINX / API GATEWAY — TEK KAPI
+--------------------------------------------------------------------------------
+
+NGINX NEDİR?
+
+Nginx, aslında genel amaçlı bir web sunucusu / "reverse proxy"dir (ters vekil
+sunucu). Reverse proxy demek: dışarıdan gelen bir isteği alıp, senin adına,
+arkadaki gerçek sunucuya iletmek, cevabı da geri döndürmek demektir. Kullanıcı
+sadece Nginx'le konuştuğunu bilir, arkada kaç sunucu olduğunu bilmez.
+
+BU PROJEDE NEDEN GEREKLİ?
+
+7 servisin her biri farklı bir portta çalışıyor (auth-service:8000,
+order-service:8000 — dikkat, hepsi container İÇİNDE 8000 portunda, dışarıya
+farklı portlarla açılıyorlar). Frontend'in "ürün listesi için 8002'ye,
+sipariş için 8003'e, auth için 8001'e git" diye bilmesi, servis sayısı
+arttıkça (veya bir servisin portu değiştikçe) frontend kodunu bozar.
+
+Bunun yerine frontend SADECE `http://localhost/api/...` adresine gider.
+Nginx, `gateway/nginx.conf` dosyasındaki kurallara göre isteği doğru servise
+yönlendirir:
+
+    location /api/orders/ {
+        proxy_pass http://order_service/;
+    }
+
+    upstream order_service {
+        server order-service:8000;
+    }
+
+Yani "/api/orders/ ile başlayan her istek, order-service container'ının
+8000 portuna gitsin" demek. Bu path-based routing (yol tabanlı yönlendirme).
+
+BU PROJEDEKİ KÜÇÜK AMA ÖNEMLİ AYRINTI
+
+`proxy_pass http://order_service/;` satırındaki sondaki `/` işareti önemli:
+bu, eşleşen path parçasını (`/api/orders/`) SİLİP, geri kalanını
+order-service'e iletir. Yani `/api/orders/orders/` isteği, order-service'e
+`/orders/` olarak ulaşır (çünkü order-service'in kendi route'ları zaten
+`/orders` prefix'i altında tanımlı — `main.py`'de
+`app.include_router(orders.router, prefix="/orders")`). Bu yüzden frontend
+kodunda (`frontend/src/lib/api.ts`) path'ler bilerek "çift" görünür:
+`api.post('/orders/orders/', ...)`. İlk `/orders/` gateway'e "hangi servise
+git" der, ikinci `/orders/` o servisin kendi iç route'udur. İlk bakışta
+kafa karıştırıcı ama bug değil, bilinçli bir tasarım.
+
+SSE İÇİN ÖZEL AYARLAR
+
+`log-service` için Nginx config'inde şunlar var:
+
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+
+Nginx normalde cevapları buffer'lar (bir miktar biriktirip topluca gönderir)
+— bu, canlı akan bir log stream'i için felaket olurdu (kullanıcı hiçbir şeyi
+"anlık" göremezdi). `proxy_buffering off` bunu kapatır, her mesaj geldiği an
+iletilir. `proxy_read_timeout` ise normalde birkaç saniyede kapanacak
+bağlantıyı, SSE (Server-Sent Events — sürekli açık kalan bir HTTP bağlantısı)
+için 1 saate kadar açık tutar.
+
+
+--------------------------------------------------------------------------------
+5. POSTGRESQL VE MONGODB — "HER SERVİSTE KENDİ VERİTABANI" İLKESİ
+--------------------------------------------------------------------------------
+
+Bu projede 3 ayrı PostgreSQL (auth, order, inventory için) ve 1 MongoDB
+(product için) var. Neden aynı PostgreSQL'i paylaşmıyorlar?
+
+Çünkü paylaşılan bir veritabanı, mikroservis mimarisinin "servisler birbirine
+sıkı bağlı olmasın" ilkesini baştan bozar. order-service, inventory-service'in
+tablosuna direkt SQL sorgusu atabilseydi:
+  - inventory-service bir gün tablo şemasını değiştirse order-service kırılır
+  - İki servis aynı satırı aynı anda güncellemeye çalışırsa lock çakışması
+    yaşarlar (birbirlerinin performansını etkilerler)
+  - "Bu veriyi kim değiştirebilir" kuralı belirsizleşir
+
+Bunun yerine kural şudur: **bir servisin verisine sadece o servis dokunur,**
+başkası isterse o servisin API'sine HTTP isteği atar. Örnek:
+`order-service`, sipariş oluştururken ürün fiyatını görmek için
+`product-service`'in veritabanına gitmiyor, `GET /products/{id}` isteği
+atıyor (`order-service/routers/orders.py` satır 49). product-service isterse
+yarın MongoDB'den PostgreSQL'e geçebilir, order-service'in bundan haberi
+bile olmaz — çünkü order-service sadece HTTP cevabıyla ilgileniyor.
+
+NEDEN PRODUCT-SERVICE MONGODB, DİĞERLERİ POSTGRESQL?
+
+Bu da mikroservisin bir başka avantajı: her servis, kendi verisine en uygun
+veritabanı türünü seçebilir ("polyglot persistence"). Ürün kataloğu —
+esnek alanlı, sık değişen şemalı, "bir ürünün özellikleri diğerinden farklı
+olabilir" türü veri — doküman veritabanları (MongoDB) için uygundur.
+Sipariş, kullanıcı, stok gibi kesin ilişkisel bütünlük (bir sipariş kesin
+bir kullanıcıya ait olmalı, toplam tutar kesin doğru hesaplanmalı) isteyen
+veriler için PostgreSQL gibi ilişkisel bir veritabanı daha güvenlidir.
+
+
+--------------------------------------------------------------------------------
+6. REDIS — HEM HAFIZA HEM ANONS SİSTEMİ
+--------------------------------------------------------------------------------
+
+Redis, temelde çok hızlı çalışan bir "key → value" (anahtar → değer) hafıza
+deposudur — RAM üzerinde çalıştığı için PostgreSQL/MongoDB'den çok daha
+hızlıdır, ama kalıcılığı (disk'e yazma garantisi) daha zayıftır. Bu projede
+Redis'in İKİ FARKLI kullanımı var, birbirine karıştırmamak önemli:
+
+KULLANIM 1: CACHE (ÖNBELLEK)
+
+`product-service`, her ürün listesi isteğinde MongoDB'ye gitmek yerine önce
+Redis'e bakar:
+
+    const cached = await redis.get('products:all')
+    if (cached) return res.json(JSON.parse(cached))
+    // yoksa MongoDB'den çek, sonra:
+    await redis.setex('products:all', 300, JSON.stringify(products))
+
+`setex`'teki `300`, saniye cinsinden TTL (Time To Live — yaşam süresi)
+demek: bu veri Redis'te 300 saniye (5 dakika) sonra kendiliğinden silinir.
+Bu, "cache-aside" denen çok yaygın bir pattern: önce hızlı depoya bak, yoksa
+yavaş kaynağa git, sonucu hızlı depoya da yaz. `auth-service` de aynı
+mantıkla JWT token'ları cache'liyor (`token:<jwt> → user_id`), böylece her
+istekte JWT'yi tekrar tekrar decode etmek yerine Redis'e bakıyor.
+
+KULLANIM 2: PUB/SUB (YAYINLA/ABONE OL)
+
+Bu, cache'ten TAMAMEN farklı bir özellik. Redis'in Pub/Sub'ı bir "kanal"a
+mesaj yayınlamana (`PUBLISH logs "mesaj"`) ve o kanala abone olan herkesin
+(`SUBSCRIBE logs`) bu mesajı ANLIK almasına izin verir. Bu projede her
+servis, önemli bir olay olduğunda `logs` kanalına küçük bir JSON mesaj
+yayınlıyor (`log_publisher.py`, her serviste var), `log-service` bu kanala
+abone olup gelen her mesajı frontend'e SSE ile akıtıyor.
+
+ÖNEMLİ FARK — Pub/Sub bir "kuyruk" DEĞİLDİR, mesajları SAKLAMAZ. Eğer o an
+kimse dinlemiyorsa, mesaj sonsuza kadar kaybolur (bir radyo yayını gibi —
+kaçırdıysan kaçırdın). Bu yüzden `log_publisher.py`'de "fire-and-forget"
+(gönder ve unut) yorumu var — loglama, asla ana iş akışını (siparişin
+başarılı olup olmaması gibi) etkilememeli, sadece "varsa dinleyen görsün"
+mantığıyla çalışıyor. Kafka ve RabbitMQ'nun (bir sonraki iki bölüm) Redis
+Pub/Sub'dan temel farkı da tam burada: onlar mesajı SAKLAR, kimse o an
+dinlemese bile.
+
+
+--------------------------------------------------------------------------------
+7. KAFKA — KAYBOLMAYAN, TEKRAR DİNLENEBİLEN OLAY GÜNLÜĞÜ
+--------------------------------------------------------------------------------
+
+KAFKA NEDİR?
+
+Kafka'yı en iyi şöyle düşünebilirsin: sürekli büyüyen, hiç silinmeyen bir
+"olay günlüğü" (log dosyası) — ama dağıtık, çok hızlı, ve birden fazla
+uygulamanın aynı anda okuyabileceği şekilde tasarlanmış. Bir servis Kafka'ya
+"şu olay oldu" diye yazar (publish), istediği kadar başka servis bu günlüğü
+kendi hızında okuyabilir (consume) — ve önemlisi, okuma işlemi günlükten
+o veriyi SİLMEZ. Aynı olayı iki farklı servis, iki farklı zamanda, birbirinden
+habersiz okuyabilir.
+
+TEMEL KAVRAMLAR
+
+- BROKER: Kafka'nın kendisi (mesajları tutan sunucu). Bu projede tek bir
+  `kafka` container'ı var (gerçek production'da birden fazla broker, birbirini
+  yedekleyecek şekilde çalışır).
+- ZOOKEEPER: Kafka'nın (bu versiyonunda) koordinasyon için ihtiyaç duyduğu
+  yardımcı bir servis — hangi broker'ın "lider" olduğu gibi metadata'yı tutar.
+  Daha yeni Kafka sürümleri Zookeeper'sız da çalışabiliyor (KRaft modu), ama
+  bu proje klasik Zookeeper'lı kurulumu kullanıyor.
+- TOPIC: Olayların kategorize edildiği "kanal" ismi. Bu projede iki topic
+  var: `order.created`, `order.cancelled`.
+- PARTITION: Bir topic, performans için birden fazla parçaya (partition)
+  bölünebilir — bu projede her topic tek partition kullanıyor (basit tutmak
+  için). Partition sayısı, ölçeklendirme konusunda Bölüm 11'de önemli olacak.
+- CONSUMER GROUP: Aynı topic'i dinleyen servisler, bir "grup ismi" ile
+  kaydolur. `inventory-service`, group_id="inventory-service" ile dinliyor;
+  `notification-service` (Go), group_id="notification-go" ile dinliyor.
+  FARKLI grup isimleri kullandıkları için, İKİSİ DE aynı mesajı bağımsız
+  olarak alır (birbirinden habersiz). Eğer aynı grup ismini kullansalardı,
+  Kafka mesajı SADECE BİRİNE verirdi (yük paylaşımı / competing consumer
+  modeli) — bu, "aynı işi iki farklı servise yaptırmak" ile "bir işi iki
+  worker arasında paylaştırmak" arasındaki farkı belirleyen kritik ayrım.
+
+BU PROJEDE KONFİGÜRASYON
+
+`docker-compose.yml`'de:
+
+    kafka:
+      environment:
+        KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+        KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+        KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+
+`KAFKA_AUTO_CREATE_TOPICS_ENABLE: true` sayesinde, `order.created` gibi bir
+topic'e ilk kez mesaj yazıldığında (veya dinlenmeye çalışıldığında) Kafka
+onu otomatik oluşturuyor — elle "önce şu topic'i yarat" demene gerek yok
+(production'da genelde bu kapatılır, topic'ler bilinçli olarak, doğru
+partition sayısıyla önceden oluşturulur).
+
+`order-service/kafka_producer.py`'de yayınlama şu kadar basit:
+
+    await producer.send_and_wait("order.created", order_data)
+
+`inventory-service/main.py`'de dinleme (bu projede test edilebilir hale
+getirdiğimiz `apply_order_event` fonksiyonuyla birlikte):
+
+    consumer = AIOKafkaConsumer("order.created", "order.cancelled", ...)
+    async for msg in consumer:
+        await apply_order_event(msg.topic, msg.value, db)
+
+NEDEN KAFKA (RabbitMQ değil de)?
+
+Çünkü burada "birden fazla BAĞIMSIZ dinleyici aynı olayı almalı" ihtiyacı
+var (notification-service VE inventory-service, ikisi de order.created'ı
+görmeli). Kafka bunun için doğal olarak tasarlanmış (pub/sub + saklama).
+Ayrıca ileride "bu olay geçmişini tekrar oynatmak" (replay) isteseydin —
+mesela yeni bir "analytics-service" eklediğinde, geçmişteki tüm siparişleri
+baştan işlemesini isteseydin — Kafka bunu mümkün kılar, RabbitMQ kılmaz
+(RabbitMQ'da bir mesaj bir kez tüketilince kuyruktan silinir).
+
+
+--------------------------------------------------------------------------------
+8. RABBITMQ — KLASİK İŞ KUYRUĞU
+--------------------------------------------------------------------------------
+
+RABBITMQ NEDİR, KAFKA'DAN FARKI NE?
+
+RabbitMQ da bir "mesaj aracısı" (message broker) ama farklı bir problemi
+çözmek için tasarlanmış: "bu işi MUTLAKA birileri yapsın, ama sadece BİR
+kişi yapsın, iki kez yapılmasın." Örnek: bir mail gönderme görevi. Bu görevi
+5 farklı worker'ın ayrı ayrı işlemesini istemezsin (kullanıcıya 5 mail
+gitmesin), ama görevin garanti işlenmesini, worker çökerse kaybolmamasını
+istersin.
+
+TEMEL KAVRAMLAR
+
+- QUEUE (KUYRUK): Görevlerin biriktiği liste. Bu projede tek bir kuyruk var:
+  `email_jobs`.
+- PUBLISHER: Kuyruğa görev ekleyen taraf — burada `notification-service`.
+- CONSUMER: Kuyruktan görev çeken taraf — burada `email-worker`.
+- ACK (ACKNOWLEDGEMENT): Bir worker bir görevi BAŞARIYLA bitirdiğinde
+  RabbitMQ'ya "bunu işledim, silebilirsin" der. `email-worker/main.py`'de:
+
+      async with message.process():  # başarıyla biterse otomatik ACK
+          job = json.loads(message.body.decode())
+          await send_mock_email(job)
+
+  Eğer worker, ACK göndermeden çökerse (örneğin işlem sırasında hata
+  fırlatırsa), RabbitMQ o görevi kuyrukta TUTAR ve başka bir worker'a
+  (ya da aynı worker yeniden başladığında ona) tekrar verir. Bu, "en az bir
+  kez işlenir" (at-least-once delivery) garantisidir — sıfır kez işlenmemesi
+  garantidir, ama teorik olarak (ACK gönderilip de bağlantı kopması gibi
+  nadir durumlarda) iki kez işlenebilir. Bu yüzden gerçek sistemlerde
+  worker'ların "idempotent" (aynı görevi iki kez işlese de sonuç değişmez)
+  yazılması önerilir — bu projede email-worker idempotent DEĞİL (aynı görev
+  iki kez gelirse iki mail "gönderilir" mock olarak), bu bilinçli bir
+  basitleştirme.
+
+- COMPETING CONSUMERS: `email-worker`'ı birden fazla instance çalıştırırsan
+  (`docker-compose up --scale email-worker=3`), hepsi aynı kuyruğu dinler
+  ve RabbitMQ görevleri aralarında OTOMATİK PAYLAŞTIRIR — her görev sadece
+  BİR worker'a gider. Bu, Kafka'daki "farklı consumer group = herkes alır"
+  mantığının tam tersi: RabbitMQ'da varsayılan davranış paylaşımdır.
+
+BU PROJEDE AKIŞ
+
+`notification-service` (Go), Kafka'dan `order.created` yakalayınca:
+
+    ch.QueueDeclare("email_jobs", true, false, false, false, nil)
+    ch.Publish("", "email_jobs", false, false, amqp.Publishing{
+        Body: jobJSON, DeliveryMode: amqp.Persistent,
+    })
+
+`DeliveryMode: Persistent` önemli: bu, görevi sadece RAM'de değil, diske de
+yazmasını söyler — RabbitMQ container'ı yeniden başlasa bile (crash sonrası)
+işlenmemiş görevler kaybolmaz.
+
+NEDEN İKİ AYRI SİSTEM (KAFKA + RABBITMQ) VAR?
+
+Bu proje bilinçli olarak ikisini de gösteriyor çünkü gerçek dünyada da farklı
+ihtiyaçlar için farklı araçlar seçilir: "olay yayınlama, birden fazla bağımsız
+dinleyici, geçmişe dönüp tekrar okuma" → Kafka. "İş kuyruğu, tek worker
+işlesin, garanti işlensin" → RabbitMQ. Bir projede ikisini birden görmek
+nadir ama bu, ikisi arasındaki farkı net anlamak için harika bir öğrenme
+fırsatı.
+
+
+--------------------------------------------------------------------------------
+9. BU SİSTEMDE İLETİŞİM NASIL "KUSURSUZ" ÇALIŞIYOR (VE NERELERDE ÇALIŞMIYOR)
+--------------------------------------------------------------------------------
+
+"Kusursuz" biraz iddialı bir kelime — dürüst olmak gerekirse bu proje bir
+öğrenim MVP'si, production-grade dayanıklılığa sahip değil. Ama üzerinde
+çalıştığımız gerçek mekanizmaları ve eksik kalan noktaları burada açıkça
+listeliyorum, çünkü bunları BİLMEK, mikroservis öğreniminin en değerli
+kısmı.
+
+ÇALIŞAN MEKANİZMALAR
+
+1. HEALTHCHECK + DEPENDS_ON (Bölüm 3) — servisler, altyapı bileşenleri
+   gerçekten hazır olana kadar başlamayı bekler. Bunu biz birlikte, gerçek
+   bir arızayı (email-worker/inventory-service'in başlangıçta çökmesi)
+   gördükten sonra ekledik.
+
+2. RESTART POLICY — `email-worker`, `inventory-service`, `notification-
+   service`'e `restart: unless-stopped` ekledik. Bir container beklenmedik
+   şekilde çökerse (crash), Docker onu otomatik yeniden başlatır. Bu,
+   "kendini iyileştirme" (self-healing) denen basit ama etkili bir pattern.
+
+3. ROBUST CONNECTION (kütüphane seviyesinde) — `email-worker`,
+   `aio_pika.connect_robust()` kullanıyor; bu, RabbitMQ bağlantısı koparsa
+   kütüphanenin kendisi arka planda otomatik yeniden bağlanmayı dener.
+   Gördük ki bu bazen tek başına yeterli oluyor (restart'a bile gerek
+   kalmadan toparlanabiliyor).
+
+4. AT-LEAST-ONCE DELIVERY (RabbitMQ ACK, Kafka consumer offset) — bir görev/
+   olay, worker onu başarıyla işleyene kadar sistemden silinmiyor.
+
+5. LOOSE COUPLING (gevşek bağlılık) — order-service, inventory-service'in
+   ayakta olup olmadığını bilmeden bile çalışabilir (event'i Kafka'ya yazar,
+   inventory-service o an kapalıysa bile event Kafka'da bekler, o servis
+   ayağa kalkınca okur). Bu, servisler arası GEÇİCİ kesintilere karşı doğal
+   bir tampon sağlıyor.
+
+ÇALIŞMAYAN / EKSİK KALAN NOKTALAR (bilinçli olarak basitleştirilmiş)
+
+1. DUAL-WRITE PROBLEMİ (Transactional Outbox eksikliği) —
+   `order-service/routers/orders.py`'de sipariş önce veritabanına yazılıyor
+   (`db.commit()`), SONRA Kafka'ya event yayınlanıyor (`publish_order_
+   created`). Bu ikisi TEK BİR işlem değil. Eğer uygulama tam bu ikisinin
+   arasında çökerse (çok düşük ihtimal ama teorik olarak mümkün), sipariş
+   veritabanında var olur ama hiçbir servis bundan haberdar olmaz — stok
+   rezerve edilmez, mail gitmez. Gerçek sistemlerde bu, "Transactional
+   Outbox" pattern'i ile çözülür (aynı veritabanı işlemi içine olayı da
+   yazıp, ayrı bir süreçle güvenli şekilde yayınlamak).
+
+2. IDEMPOTENCY EKSİKLİĞİ — Bir Kafka mesajı ya da RabbitMQ görevi (nadiren
+   de olsa) iki kez işlenirse, `inventory-service` stoğu iki kez artırır,
+   `email-worker` iki mail "gönderir". Gerçek sistemlerde her mesaja
+   benzersiz bir ID verilip, "bu ID'yi daha önce işledim mi" kontrolü
+   yapılır.
+
+3. CIRCUIT BREAKER / RETRY EKSİKLİĞİ — `order-service`, `product-service`
+   veya `auth-service`'e HTTP isteği atarken (senkron çağrı), o servis o an
+   yanıt vermiyorsa direkt hata döner, tekrar denemez. Gerçek sistemlerde bu
+   tip senkron çağrılar retry + circuit breaker ile korunur.
+
+4. NGINX'İN UPSTREAM IP CACHE'LEMESİ — Bu projede canlı olarak yaşadığımız
+   bir sorun: bir servisi tek başına `docker restart` edersen, o container
+   yeni bir IP alır ama Nginx bunu otomatik fark etmez (bir sonraki bölümde
+   detaylı anlatıyorum, çünkü ölçeklendirmeyle doğrudan ilgili).
+
+
+--------------------------------------------------------------------------------
+10. CI/CD NEDİR, BU PROJEDE VAR MI?
+--------------------------------------------------------------------------------
+
+CI/CD NEDİR?
+
+- CI (Continuous Integration / Sürekli Entegrasyon): Kod her push edildiğinde
+  otomatik olarak testlerin çalıştırılması, kodun derlenip derlenmediğinin
+  kontrol edilmesi. Amaç: "bir hata, insan fark etmeden önce, otomatik
+  olarak yakalansın."
+- CD (Continuous Deployment/Delivery / Sürekli Dağıtım): Testler geçtikten
+  sonra, kodun otomatik olarak (insan müdahalesi olmadan ya da minimal
+  onayla) production ortamına deploy edilmesi.
+
+Tipik bir akış: sen `git push` yaparsın → GitHub Actions (ya da GitLab CI,
+Jenkins vb.) otomatik tetiklenir → her serviste testler çalışır (bu projede
+artık 7 servisin de test suite'i var — CI için hazır durumdalar) → testler
+geçerse Docker image'ları inşa edilip bir registry'ye (Docker Hub, GitHub
+Container Registry) push edilir → oradan sunucuya/Kubernetes'e deploy edilir.
+
+BU PROJEDE VAR MI?
+
+Hayır — şu an bu repoda `.github/workflows/` klasörü yok, yani hiçbir
+otomatik CI/CD pipeline'ı tanımlı değil. Testleri (ve Docker build'lerini)
+şu ana kadar hep elle, senin isteğinle ben çalıştırdım.
+
+BU PROJEYE EKLENSEYDİ NASIL GÖRÜNÜRDÜ? (somut örnek)
+
+`.github/workflows/test.yml` gibi bir dosya, her `git push`'ta şunu yapardı:
+
+    - GitHub'ın sunucusunda bir sanal makine ayağa kalkar
+    - Python 3.11 + Node.js + Go kurulur
+    - Her servisin klasörüne girip test komutlarını çalıştırır:
+        cd services/auth-service && pip install -r requirements-test.txt
+                                   && pytest tests/
+        cd services/product-service && npm ci && npm test
+        (... diğer 5 servis için de aynısı ...)
+    - Herhangi biri FAILED olursa, GitHub PR'ında kırmızı bir çarpı işareti
+      görürsün, kodu birleştirmene (merge) izin vermeyebilir
+    - Hepsi geçerse yeşil tik, ve isteğe bağlı olarak bir sonraki adımda
+      `docker-compose build` ile tüm image'lar inşa edilip bir registry'ye
+      push edilebilir
+
+Bunun projene katacağı en somut değer: bugün az önce bulduğumuz "sipariş
+iptalinde stok geri düşmüyor" gibi bir bug'ı, sen elle test etmeden, kodu
+push eder etmez otomatik yakalardı (çünkü artık `inventory-service` testleri
+bunu kontrol ediyor).
+
+
+--------------------------------------------------------------------------------
+11. SERVİSLERİ ÖLÇEKLENDİRSEYDİK NELERE DİKKAT ETMEMİZ GEREKİRDİ?
+--------------------------------------------------------------------------------
+
+"Ölçeklendirme" (scaling) demek, bir servisin AYNI ANDA BİRDEN FAZLA
+KOPYASININ (instance) çalışması demek — örneğin trafik arttığında
+`order-service`'i tek container yerine 3 container olarak çalıştırmak
+(`docker-compose up --scale order-service=3`). Her bileşen için ayrı ayrı
+nelere dikkat etmek gerektiğini gerçek proje dosyalarına bağlayarak
+anlatıyorum:
+
+1. SERVİSLER "STATELESS" (DURUMSUZ) OLMALI
+
+   Bir servisin kendi içinde (RAM'inde, diskinde) kalıcı bir "durum"
+   (state) tutmaması gerekir — çünkü bir sonraki istek, 3 kopyadan
+   HANGİSİNE gideceği belli olmayan şekilde dağıtılır (load balancing).
+   Bu proje bu konuda doğru tasarlanmış: `auth-service`, oturum bilgisini
+   kendi RAM'inde değil, PAYLAŞILAN Redis'te tutuyor (`token:<jwt> →
+   user_id`). Yani `auth-service`'in 3 kopyası olsa, hangisine istek
+   giderse gitsin, hepsi aynı Redis'e bakar, aynı cevabı verir. Eğer token
+   bir instance'ın kendi RAM'inde tutulsaydı, kullanıcı 2. isteğinde farklı
+   bir instance'a düşerse "tanımıyorum" derdi — bu yüzden "paylaşılan durum
+   dışarıda" ilkesi kritik.
+
+2. NGINX'İN YÜK DAĞITIMI (LOAD BALANCING) VE IP CACHE SORUNU
+
+   `nginx.conf`'taki `upstream order_service { server order-service:8000; }`
+   bloğuna birden fazla satır eklersen (`server order-service:8000;` üç kez,
+   ya da Docker'ın DNS round-robin'i ile), Nginx istekleri bu kopyalar
+   arasında otomatik dağıtabilir. AMA — bu projede canlı olarak yaşadığımız
+   bir sorunu burada tekrar vurgulamak istiyorum: Nginx, `upstream` içindeki
+   servis ismini (`order-service`) IP adresine SADECE BİR KEZ, başlangıçta
+   çözer ve bunu önbelleğe alır (cache'ler). Bir container yeniden
+   başladığında (yeni IP aldığında), Nginx bunu fark etmez, eski (artık
+   geçersiz) IP'ye istek atmaya devam eder → 502 Bad Gateway hatası. Bunu
+   testler sırasında bizzat gördük: `inventory-service`'i tek başına
+   restart ettiğimizde gateway 502 vermeye başladı, gateway'i de restart
+   edince düzeldi.
+
+   Ölçeklendirilmiş (birden fazla, sık sık değişen instance'lı) bir sistemde
+   bu sorun çok daha sık yaşanır. Gerçek çözümler: Nginx'e bir `resolver`
+   direktifi ekleyip DNS TTL'ini kısaltmak, ya da (daha sağlam) Kubernetes
+   gibi bir orkestratör kullanmak — Kubernetes'in kendi "Service" nesnesi,
+   arkadaki pod'lar (container'lar) değiştikçe trafiği otomatik doğru yere
+   yönlendirir, bu problemi kökten çözer.
+
+3. KAFKA'DA PARTITION SAYISI CONSUMER SAYISINI SINIRLAR
+
+   Bu, en çok yanlış anlaşılan noktalardan biri. Bir Kafka topic'inin
+   partition sayısı, O TOPIC'İ AYNI CONSUMER GROUP İÇİNDE AYNI ANDA EN FAZLA
+   KAÇ INSTANCE'IN PARALEL OKUYABİLECEĞİNİ belirler. Bu projede
+   `order.created` topic'i TEK partition'lı. Yani `inventory-service`'i
+   3 kopyaya çıkarsan (hepsi aynı group_id="inventory-service" ile), Kafka
+   bu tek partition'ı SADECE BİR instance'a atar, diğer 2 instance boşta
+   bekler, hiçbir iş almaz! Gerçek ölçeklendirme için partition sayısını en
+   az hedeflenen paralel worker sayısı kadar artırman gerekir (örneğin 3
+   worker istiyorsan en az 3 partition).
+
+4. RABBITMQ'DA BU SORUN YOK (DOĞAL YÜK PAYLAŞIMI)
+
+   RabbitMQ'daki `email_jobs` kuyruğu, Bölüm 8'de anlattığımız gibi zaten
+   "competing consumers" modeliyle çalışıyor — `email-worker`'ı kaç kopyaya
+   çıkarırsan çıkar, hepsi otomatik olarak kuyruğu paylaşır, elle bir ayar
+   yapmana gerek yok. Bu, Kafka'ya göre ölçeklendirmesi daha "sürtünmesiz"
+   bir sistem.
+
+5. VERİTABANI BAĞLANTI HAVUZU (CONNECTION POOL) LİMİTLERİ
+
+   Her `order-service` instance'ı, PostgreSQL'e kendi bağlantı havuzunu açar
+   (`database.py`'deki `create_async_engine`). 3 instance'ın her biri
+   varsayılan olarak birkaç bağlantı açarsa, PostgreSQL'in kabul edebileceği
+   toplam bağlantı sayısını (varsayılan ~100) aşman kolaylaşır. Ölçeklendirme
+   yapıyorsan, ya PostgreSQL'in `max_connections` ayarını artırman ya da
+   PgBouncer gibi bir "connection pooler" araya koyman gerekir.
+
+6. REDIS TEK BAŞINA "TEK NOKTA" (SINGLE POINT) HALİNE GELEBİLİR
+
+   Tüm servisler cache ve pub/sub için TEK bir Redis container'ına bağımlı.
+   Servisleri ne kadar çok ölçeklendirirsen ölçeklendir, hepsi aynı Redis'e
+   yığılır — bir noktadan sonra Redis darboğaz (bottleneck) haline gelebilir,
+   ya da o container çökerse TÜM sistem (cache, log akışı, oturumlar)
+   etkilenir. Gerçek sistemlerde bu, Redis Cluster (Redis'in kendisini de
+   birden fazla node'a dağıtan bir kurulum) ile çözülür.
+
+7. IDEMPOTENCY ÖNEMİ ARTAR
+
+   Bölüm 9'da bahsettiğim "bir mesaj iki kez işlenirse ne olur" sorunu,
+   ölçeklendirilmiş sistemlerde DAHA SIK karşına çıkar — çünkü daha fazla
+   instance, daha fazla ağ hop'u, daha fazla "yeniden deneme" (retry) demek,
+   bu da "aynı mesajın iki kez işlenmesi" ihtimalini artırır. Ölçeklendirmeden
+   önce mutlaka bu konuyu (her worker'ın "bu işi daha önce yaptım mı" kontrol
+   edebilmesi) çözmen gerekir.
+
+8. SERVİS KEŞFİ (SERVICE DISCOVERY) DOCKER COMPOSE'UN SINIRINDA KALIR
+
+   Şu an "servis keşfi" (bir servisin diğerini nasıl bulacağı) Docker
+   Compose'un basit dahili DNS'iyle çözülüyor — küçük, sabit sayıda servis
+   için yeterli. Ama servisleri dinamik olarak ölçeklendirmeye (trafiğe göre
+   otomatik instance sayısı artırıp azaltmaya, "auto-scaling") başladığında,
+   bu basit DNS yetersiz kalır. Bu noktada Kubernetes gibi bir orkestratöre
+   ya da Consul/Eureka gibi özel bir "service registry"ye geçilir — bunlar,
+   "şu an hangi servisin kaç kopyası, hangi IP'lerde çalışıyor" bilgisini
+   gerçek zamanlı tutar ve günceller.
+
+
+--------------------------------------------------------------------------------
+12. KAPANIŞ VE SIRADA NE VAR
+--------------------------------------------------------------------------------
+
+Bu proje, gerçek mikroservis mimarisinin neredeyse tüm temel taşlarını
+küçük ölçekte gösteriyor: API Gateway, database-per-service, event-driven
+iletişim (Kafka), task queue (RabbitMQ), cache + pub/sub (Redis), health
+check'ler, container orkestrasyonu (Docker Compose). Bunları birlikte
+kurup, bozup, düzelttik — "neden Kafka bağlanamadı", "neden gateway 502
+verdi", "neden stok geri düşmüyor" gibi gerçek arızalar üzerinden öğrendin,
+bu da teoriden çok daha kalıcı bir öğrenim şekli.
+
+Bu belgede bahsedilen ama projede henüz OLMAYAN konular (istersen sırayla
+üzerlerine gidebiliriz):
+  - CI/CD pipeline'ı (GitHub Actions ile)
+  - Transactional Outbox (dual-write problemi çözümü)
+  - Circuit Breaker / Retry (senkron çağrılar için dayanıklılık)
+  - Idempotency (mesajların iki kez işlenmesine karşı koruma)
+  - Kubernetes (Docker Compose'un yerini alacak, gerçek ölçeklendirme
+    yapabilen bir orkestratör)
+  - Rol tabanlı yetkilendirme (şu an tüm kullanıcılar aynı yetkiye sahip)
+
+Projenin köküne daha önce eklediğimiz iki dosyaya da bakmanı öneririm:
+  - CLAUDE.md → projeyi nasıl ayağa kaldırıp test edeceğin, pratik notlar
+  - informationforhumandeveloper.md → burada anlatılan pattern'lerin kod
+    içindeki tam satır referansları
