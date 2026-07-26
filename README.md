@@ -7,6 +7,8 @@ Mikroservis mimarisinin temel kavramlarını — polyglot stack, event-driven il
 
 ## Mimari
 
+![Mimari Şema](sema.png)
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │                  Frontend  (Vite + React)                │
