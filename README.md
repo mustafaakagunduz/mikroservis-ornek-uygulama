@@ -137,6 +137,19 @@ cd services/order-service && python3 -m pytest tests/ -v
 
 # product-service — unit, DB mock'lu (Jest)
 cd services/product-service && npm test
+
+# inventory-service — Kafka event işleme mantığı, DB mock'lu (pytest)
+cd services/inventory-service && python3 -m pytest tests/ -v
+
+# email-worker — RabbitMQ job işleme, mock'lu (pytest)
+cd services/email-worker && python3 -m pytest tests/ -v
+
+# log-service — Redis Pub/Sub → SSE dönüşümü, mock'lu (pytest)
+cd services/log-service && python3 -m pytest tests/ -v
+
+# notification-service — event→job dönüşüm mantığı (Go testing), Docker üzerinden
+cd services/notification-service
+docker run --rm -v "$(pwd)":/app -w /app -e GOFLAGS="-p=1" -e CGO_ENABLED=0 golang:1.24-alpine go test ./... -v
 ```
 
 ---

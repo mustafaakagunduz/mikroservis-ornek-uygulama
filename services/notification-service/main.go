@@ -115,6 +115,30 @@ func newKafkaReader(brokers, topic, groupID string) *kafka.Reader {
 	})
 }
 
+// buildEmailJob, bir Kafka OrderEvent'ini RabbitMQ'ya basılacak EmailJob'a çevirir.
+// Kafka/RabbitMQ bağlantısından bağımsız, saf bir fonksiyon — test'ler gerçek
+// altyapıya ihtiyaç duymadan bunu doğrudan çağırabilir.
+func buildEmailJob(topic string, event OrderEvent) (EmailJob, bool) {
+	switch topic {
+	case "order.created":
+		return EmailJob{
+			Type:       "order_confirmation",
+			UserID:     event.UserID,
+			OrderID:    event.OrderID,
+			TotalPrice: event.TotalPrice,
+			Items:      event.Items,
+		}, true
+	case "order.cancelled":
+		return EmailJob{
+			Type:    "order_cancellation",
+			UserID:  event.UserID,
+			OrderID: event.OrderID,
+		}, true
+	default:
+		return EmailJob{}, false
+	}
+}
+
 func consumeTopic(ctx context.Context, brokers, topic, groupID, rabbitURL string) {
 	reader := newKafkaReader(brokers, topic, groupID)
 	defer reader.Close()
@@ -145,22 +169,9 @@ func consumeTopic(ctx context.Context, brokers, topic, groupID, rabbitURL string
 		publishLog("info", "kafka.consumed",
 			fmt.Sprintf("Kafka event alındı: '%s' → sipariş #%s", topic, shortOrder))
 
-		var job EmailJob
-		switch topic {
-		case "order.created":
-			job = EmailJob{
-				Type:       "order_confirmation",
-				UserID:     event.UserID,
-				OrderID:    event.OrderID,
-				TotalPrice: event.TotalPrice,
-				Items:      event.Items,
-			}
-		case "order.cancelled":
-			job = EmailJob{
-				Type:    "order_cancellation",
-				UserID:  event.UserID,
-				OrderID: event.OrderID,
-			}
+		job, ok := buildEmailJob(topic, event)
+		if !ok {
+			continue
 		}
 
 		if err := publishToRabbitMQ(rabbitURL, job); err != nil {

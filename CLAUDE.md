@@ -24,9 +24,21 @@ Uygulama: http://localhost:5173 · RabbitMQ paneli: http://localhost:15672 (`use
 cd services/auth-service && python3 -m pytest tests/ -v      # 17 test
 cd services/order-service && python3 -m pytest tests/ -v     # 9 test
 cd services/product-service && npm test                       # 8 test
+cd services/inventory-service && python3 -m pytest tests/ -v # 10 test
+cd services/email-worker && python3 -m pytest tests/ -v      # 4 test
+cd services/log-service && python3 -m pytest tests/ -v       # 5 test
 ```
 
-Docker ayakta olmasa da çalışır (mock'lu). `inventory-service`, `notification-service`, `email-worker`, `log-service` için ayrı unit test yok — bu servisler yalnızca gerçek stack üzerinden (event akışını izleyerek) test edilebilir.
+Docker ayakta olmasa da çalışır (hepsi mock'lu — gerçek DB/Redis/Kafka/RabbitMQ'ya ihtiyaç yok).
+
+`notification-service` (Go) için Docker üzerinden çalıştır (host'ta Go kurulu değilse):
+
+```bash
+cd services/notification-service
+docker run --rm -v "$(pwd)":/app -w /app -e GOFLAGS="-p=1" -e CGO_ENABLED=0 -e GOGC=20 golang:1.24-alpine go test ./... -v   # 3 test
+```
+
+`-p=1`/`CGO_ENABLED=0`/`GOGC=20` düşük bellekli ortamlarda (örn. Colima'nın varsayılan 2GB VM'i) derleyicinin OOM'a takılmasını önlemek için — aynı ayar `notification-service/Dockerfile`'da da var, `docker-compose up --build` sırasında otomatik uygulanır.
 
 ## Bilinmesi gereken tuhaflıklar (bug değil)
 
